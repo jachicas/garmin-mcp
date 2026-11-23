@@ -4,11 +4,12 @@ Single-user model: one shared password (set via ``MCP_AUTH_PASSWORD``) gates
 every authorisation. Tokens are JWTs signed with ``JWT_SECRET``. Refresh
 tokens rotate on every use.
 
-This intentionally trades durability for simplicity: clients, codes, and
-refresh tokens live in process memory and disappear on restart. Access
-tokens survive restarts because they are stateless JWTs. For a single-user
-personal server this is fine: the user simply re-authorises every cold
-start of the OAuth flow.
+Restart-proof by design: access AND refresh tokens are stateless JWTs signed
+with ``JWT_SECRET``, and a client that registered before a restart is
+recognised again (see ``get_client``). So a redeploy, a crash or a host that
+sleeps no longer forces the user to log in again: Claude simply refreshes.
+Only authorisation codes and pending logins (both short-lived, mid-handshake)
+live in memory.
 """
 
 from __future__ import annotations
@@ -32,7 +33,16 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 log = structlog.get_logger(__name__)
 
 ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
-REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
+# Long-lived on purpose: every refresh issues a new one, so the user only logs
+# in again after a full year without using the connector.
+REFRESH_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60
+
+# Redirect URIs a client may be re-created with after a restart wiped the
+# in-memory registry. Override with MCP_KNOWN_REDIRECT_URIS (comma separated).
+DEFAULT_KNOWN_REDIRECT_URIS = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+)
 AUTHORIZATION_CODE_TTL_SECONDS = 10 * 60
 LOGIN_STATE_TTL_SECONDS = 10 * 60
 
@@ -46,7 +56,13 @@ class SimpleOAuthProvider(
 ):
     """Single-user OAuth server backed by a shared password and JWT secret."""
 
-    def __init__(self, mcp_password: str, jwt_secret: str, issuer_url: str) -> None:
+    def __init__(
+        self,
+        mcp_password: str,
+        jwt_secret: str,
+        issuer_url: str,
+        known_redirect_uris: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
         if not mcp_password:
             raise ValueError("mcp_password must be a non-empty string.")
         if not jwt_secret or len(jwt_secret) < 16:
@@ -54,15 +70,36 @@ class SimpleOAuthProvider(
         self._password = mcp_password
         self._jwt_secret = jwt_secret
         self._issuer_url = issuer_url.rstrip("/")
+        self._known_redirect_uris = tuple(known_redirect_uris or DEFAULT_KNOWN_REDIRECT_URIS)
 
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._codes: dict[str, AuthorizationCode] = {}
-        self._refresh_tokens: dict[str, RefreshToken] = {}
+        # Refresh tokens are stateless JWTs; this only holds revoked ones
+        # (token -> expiry) until they would have expired anyway.
+        self._revoked_refresh: dict[str, int] = {}
         # state -> (client_id, params, created_at)
         self._pending_logins: dict[str, tuple[str, AuthorizationParams, float]] = {}
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self._clients.get(client_id)
+        client = self._clients.get(client_id)
+        if client is not None or not client_id:
+            return client
+        # The registry is in memory, so a restart forgets clients Claude
+        # registered earlier. Re-create the client as a public one (no secret)
+        # limited to the known redirect URIs: refresh tokens are still bound to
+        # this client_id and signed with JWT_SECRET, and new logins still need
+        # the password, so this only lets an already-authorised client resume.
+        client = OAuthClientInformationFull(
+            client_id=client_id,
+            redirect_uris=list(self._known_redirect_uris),
+            token_endpoint_auth_method="none",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            scope="mcp",
+        )
+        self._clients[client_id] = client
+        log.info("oauth.client.restored", client_id=client_id)
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         client_id = client_info.client_id
@@ -150,13 +187,7 @@ class SimpleOAuthProvider(
             authorization_code.scopes,
             authorization_code.resource,
         )
-        refresh_value = secrets.token_urlsafe(32)
-        self._refresh_tokens[refresh_value] = RefreshToken(
-            token=refresh_value,
-            client_id=client_id,
-            scopes=authorization_code.scopes,
-            expires_at=int(time.time()) + REFRESH_TOKEN_TTL_SECONDS,
-        )
+        refresh_value = self._mint_refresh_jwt(client_id, authorization_code.scopes)
         return OAuthToken(
             access_token=access_token,
             token_type="Bearer",
@@ -170,13 +201,27 @@ class SimpleOAuthProvider(
         client: OAuthClientInformationFull,
         refresh_token: str,
     ) -> RefreshToken | None:
-        rt = self._refresh_tokens.get(refresh_token)
-        if rt is None or rt.client_id != client.client_id:
+        if refresh_token in self._revoked_refresh:
             return None
-        if rt.expires_at is not None and rt.expires_at <= int(time.time()):
-            self._refresh_tokens.pop(refresh_token, None)
+        try:
+            payload: dict[str, Any] = jwt.decode(
+                refresh_token,
+                self._jwt_secret,
+                algorithms=["HS256"],
+                audience=self._issuer_url,
+                issuer=self._issuer_url,
+            )
+        except jwt.PyJWTError as exc:
+            log.info("oauth.refresh_token.invalid", error=str(exc))
             return None
-        return rt
+        if payload.get("typ") != "refresh" or payload.get("sub") != client.client_id:
+            return None
+        return RefreshToken(
+            token=refresh_token,
+            client_id=payload["sub"],
+            scopes=list(payload.get("scopes", [])),
+            expires_at=int(payload["exp"]),
+        )
 
     async def exchange_refresh_token(
         self,
@@ -184,19 +229,13 @@ class SimpleOAuthProvider(
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Rotation: invalidate the presented refresh token immediately.
+        # A new refresh token is issued on every use. The old one is not kept in
+        # a deny-list on purpose: if Claude retries a refresh after a network
+        # blip it must not get locked out (single-user server).
         client_id = self._require_client_id(client)
-        self._refresh_tokens.pop(refresh_token.token, None)
-
         new_scopes = scopes or refresh_token.scopes
         access_token = self._mint_jwt(client_id, new_scopes, None)
-        new_refresh = secrets.token_urlsafe(32)
-        self._refresh_tokens[new_refresh] = RefreshToken(
-            token=new_refresh,
-            client_id=client_id,
-            scopes=new_scopes,
-            expires_at=int(time.time()) + REFRESH_TOKEN_TTL_SECONDS,
-        )
+        new_refresh = self._mint_refresh_jwt(client_id, new_scopes)
         return OAuthToken(
             access_token=access_token,
             token_type="Bearer",
@@ -217,6 +256,8 @@ class SimpleOAuthProvider(
         except jwt.PyJWTError as exc:
             log.debug("oauth.access_token.invalid", error=str(exc))
             return None
+        if payload.get("typ") == "refresh":
+            return None
 
         return AccessToken(
             token=token,
@@ -228,7 +269,9 @@ class SimpleOAuthProvider(
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         if isinstance(token, RefreshToken):
-            self._refresh_tokens.pop(token.token, None)
+            now = int(time.time())
+            self._revoked_refresh = {t: e for t, e in self._revoked_refresh.items() if e > now}
+            self._revoked_refresh[token.token] = int(token.expires_at or now + REFRESH_TOKEN_TTL_SECONDS)
         # Access tokens are stateless JWTs. We accept the revoke call so the
         # endpoint reports success, but the token will continue to validate
         # until it expires. For a single-user server this is acceptable.
@@ -250,6 +293,21 @@ class SimpleOAuthProvider(
         }
         if resource is not None:
             payload["resource"] = resource
+        encoded = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
+        return encoded if isinstance(encoded, str) else encoded.decode("ascii")
+
+    def _mint_refresh_jwt(self, client_id: str, scopes: list[str]) -> str:
+        now = int(time.time())
+        payload: dict[str, Any] = {
+            "typ": "refresh",
+            "sub": client_id,
+            "iss": self._issuer_url,
+            "aud": self._issuer_url,
+            "iat": now,
+            "exp": now + REFRESH_TOKEN_TTL_SECONDS,
+            "jti": secrets.token_urlsafe(12),
+            "scopes": scopes or [],
+        }
         encoded = jwt.encode(payload, self._jwt_secret, algorithm="HS256")
         return encoded if isinstance(encoded, str) else encoded.decode("ascii")
 

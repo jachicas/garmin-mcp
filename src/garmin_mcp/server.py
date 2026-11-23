@@ -173,10 +173,12 @@ _TRANSPORT: str = "stdio"
 _oauth_provider: SimpleOAuthProvider | None = None
 
 if AUTH_ENABLED:
+    _known = [u.strip() for u in os.getenv("MCP_KNOWN_REDIRECT_URIS", "").split(",") if u.strip()]
     _oauth_provider = SimpleOAuthProvider(
         mcp_password=MCP_PASSWORD,
         jwt_secret=JWT_SECRET,
         issuer_url=ISSUER_URL,
+        known_redirect_uris=_known or None,
     )
     auth_settings = AuthSettings(
         issuer_url=AnyHttpUrl(ISSUER_URL),
