@@ -83,3 +83,43 @@ async def test_clear_removes_all_entries() -> None:
     await cache.set("b", 2, 60)
     await cache.clear()
     assert await cache.size() == 0
+
+
+def test_incomplete_result_is_cached_briefly():
+    import asyncio
+
+    from garmin_mcp.cache import TTLCache
+
+    async def scenario():
+        cache = TTLCache()
+        calls = {"n": 0}
+
+        async def compute():
+            calls["n"] += 1
+            return {"score": None}
+
+        await cache.get_or_compute("k", 3600, compute, incomplete=lambda r: r["score"] is None, incomplete_ttl_seconds=0)
+        await cache.get_or_compute("k", 3600, compute, incomplete=lambda r: r["score"] is None, incomplete_ttl_seconds=0)
+        return calls["n"]
+
+    assert asyncio.run(scenario()) == 2
+
+
+def test_complete_result_uses_full_ttl():
+    import asyncio
+
+    from garmin_mcp.cache import TTLCache
+
+    async def scenario():
+        cache = TTLCache()
+        calls = {"n": 0}
+
+        async def compute():
+            calls["n"] += 1
+            return {"score": 80}
+
+        await cache.get_or_compute("k", 3600, compute, incomplete=lambda r: r["score"] is None, incomplete_ttl_seconds=0)
+        await cache.get_or_compute("k", 3600, compute, incomplete=lambda r: r["score"] is None, incomplete_ttl_seconds=0)
+        return calls["n"]
+
+    assert asyncio.run(scenario()) == 1

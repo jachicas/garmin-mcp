@@ -50,8 +50,15 @@ class TTLCache:
         key: str,
         ttl_seconds: float,
         compute: Callable[[], Awaitable[Any]],
+        incomplete: Callable[[Any], bool] | None = None,
+        incomplete_ttl_seconds: float = 60,
     ) -> Any:
         """Return cached value or compute and store it.
+
+        ``incomplete`` flags a result that Garmin has not finished producing yet
+        (e.g. last night's HRV before the watch synced). Such a result is kept
+        only ``incomplete_ttl_seconds`` so the next call asks Garmin again
+        instead of serving the empty answer for the full TTL.
 
         Note: two concurrent callers with the same key may both miss and both
         call ``compute``. That is fine for our workload because Garmin calls
@@ -61,7 +68,14 @@ class TTLCache:
         if cached is not None:
             return cached
         value = await compute()
-        await self.set(key, value, ttl_seconds)
+        ttl = ttl_seconds
+        if incomplete is not None:
+            try:
+                if incomplete(value):
+                    ttl = min(ttl_seconds, incomplete_ttl_seconds)
+            except Exception:  # a bad predicate must never break the tool
+                ttl = min(ttl_seconds, incomplete_ttl_seconds)
+        await self.set(key, value, ttl)
         return value
 
     async def clear(self) -> None:

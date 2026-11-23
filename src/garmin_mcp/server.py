@@ -218,6 +218,11 @@ else:
 # ---------------------------------------------------------------------------
 
 _cache = TTLCache()
+# Daily wellness data changes during the morning as the watch syncs, so keep it
+# short. Results Garmin has not finished yet (see ``incomplete=``) are re-asked
+# after EMPTY_RESULT_TTL_SECONDS.
+WELLNESS_TTL_SECONDS = 600
+EMPTY_RESULT_TTL_SECONDS = 60
 _garmin: GarminClient | None = None
 
 
@@ -312,7 +317,10 @@ async def get_sleep(date: str | None = None) -> SleepSummary:
         raw = await client.call("get_sleep_data", target_date)
         return _parse_sleep(raw, target_date)
 
-    result: SleepSummary = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: SleepSummary = await _cache.get_or_compute(
+        cache_key, WELLNESS_TTL_SECONDS, fetch,
+        incomplete=lambda r: r.sleep_score is None, incomplete_ttl_seconds=EMPTY_RESULT_TTL_SECONDS,
+    )
     return result
 
 
@@ -393,7 +401,7 @@ async def get_training_load(days: int = 7) -> TrainingLoadSummary:
                 latest_status = status
         return _build_training_load_summary(per_day, latest_status)
 
-    result: TrainingLoadSummary = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: TrainingLoadSummary = await _cache.get_or_compute(cache_key, WELLNESS_TTL_SECONDS, fetch)
     return result
 
 
@@ -421,7 +429,10 @@ async def get_hrv_status() -> HRVStatus:
         readings.reverse()  # oldest first for the trend
         return _build_hrv_status(headline, readings)
 
-    result: HRVStatus = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: HRVStatus = await _cache.get_or_compute(
+        cache_key, WELLNESS_TTL_SECONDS, fetch,
+        incomplete=lambda r: r.last_night_avg_ms is None, incomplete_ttl_seconds=EMPTY_RESULT_TTL_SECONDS,
+    )
     return result
 
 
@@ -440,7 +451,10 @@ async def get_body_battery(date: str | None = None) -> BodyBatterySummary:
         raw = await client.call("get_body_battery", target_date, target_date)
         return _parse_body_battery(raw, target_date)
 
-    result: BodyBatterySummary = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: BodyBatterySummary = await _cache.get_or_compute(
+        cache_key, WELLNESS_TTL_SECONDS, fetch,
+        incomplete=lambda r: r.current_value is None, incomplete_ttl_seconds=EMPTY_RESULT_TTL_SECONDS,
+    )
     return result
 
 
@@ -490,7 +504,7 @@ async def get_resting_heart_rate(days: int = 7) -> RestingHeartRateTrend:
         avg = sum(valid) / len(valid) if valid else None
         return RestingHeartRateTrend(days=rows, avg_rhr_bpm=avg)
 
-    result: RestingHeartRateTrend = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: RestingHeartRateTrend = await _cache.get_or_compute(cache_key, WELLNESS_TTL_SECONDS, fetch)
     return result
 
 
@@ -516,7 +530,7 @@ async def get_stress(date: str | None = None) -> StressSummary:
             summary = None
         return _parse_stress(raw, target_date, summary)
 
-    result: StressSummary = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: StressSummary = await _cache.get_or_compute(cache_key, WELLNESS_TTL_SECONDS, fetch)
     return result
 
 
@@ -538,7 +552,10 @@ async def get_training_readiness(date: str | None = None) -> TrainingReadiness:
         raw = await client.call("get_training_readiness", target_date)
         return _parse_training_readiness(raw, target_date)
 
-    result: TrainingReadiness = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: TrainingReadiness = await _cache.get_or_compute(
+        cache_key, WELLNESS_TTL_SECONDS, fetch,
+        incomplete=lambda r: r.score is None, incomplete_ttl_seconds=EMPTY_RESULT_TTL_SECONDS,
+    )
     return result
 
 
@@ -686,7 +703,7 @@ async def get_body_composition(
         raw = await client.call("get_body_composition", start, end)
         return _parse_body_composition(raw)
 
-    result: BodyCompositionTrend = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: BodyCompositionTrend = await _cache.get_or_compute(cache_key, WELLNESS_TTL_SECONDS, fetch)
     return result
 
 
@@ -705,7 +722,7 @@ async def get_respiration(date: str | None = None) -> RespirationSummary:
         raw = await client.call("get_respiration_data", target_date)
         return _parse_respiration(raw, target_date)
 
-    result: RespirationSummary = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: RespirationSummary = await _cache.get_or_compute(cache_key, WELLNESS_TTL_SECONDS, fetch)
     return result
 
 
@@ -742,7 +759,7 @@ async def get_weekly_summary(
             raw = await client.call("get_weekly_stress", end, weeks)
         return _parse_weekly_summary(metric_norm, raw, weeks)
 
-    result: WeeklySummary = await _cache.get_or_compute(cache_key, 3600, fetch)
+    result: WeeklySummary = await _cache.get_or_compute(cache_key, WELLNESS_TTL_SECONDS, fetch)
     return result
 
 
